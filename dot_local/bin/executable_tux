@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSIONS_FILE="${HOME}/.config/tux/sessions"
+
+ensure_sessions_file() {
+  mkdir -p "$(dirname "$SESSIONS_FILE")"
+  [[ -f "$SESSIONS_FILE" ]] || cat > "$SESSIONS_FILE" <<'EOT'
+# Put one tmux session name per line.
+# Lines starting with # are comments.
+EOT
+}
+
+open_editor() {
+  local f="$1"
+  if [[ -n "${EDITOR-}" ]]; then
+    exec "${EDITOR}" "$f"
+  elif command -v nvim >/dev/null 2>&1; then
+    exec nvim "$f"
+  elif command -v vim >/dev/null 2>&1; then
+    exec vim "$f"
+  elif command -v nano >/dev/null 2>&1; then
+    exec nano "$f"
+  else
+    echo "No editor found. Set \$EDITOR or install vim/nvim/nano." >&2
+    exit 1
+  fi
+}
+
+# ---- subcommand: edit ----
+if [[ "${1-}" == "edit" ]]; then
+  ensure_sessions_file
+  open_editor "$SESSIONS_FILE"
+fi
+
+# ---------- helpers ----------
+read_predefined() {
+  if [[ -f "$SESSIONS_FILE" ]]; then
+    grep -vE '^\s*#' "$SESSIONS_FILE" | awk 'NF{print $0}' || true
+  fi
+}
+
+read_existing_tmux() {
+  tmux list-sessions -F '#S' 2>/dev/null || true
+}
+
+all_sessions() {
+  { read_predefined; read_existing_tmux; } | awk 'NF' | sort -u
+}
+
+# ---------- main ----------
+SESSIONS="$(all_sessions)"
+if [[ -z "${SESSIONS}" ]]; then
+  echo "No sessions found. Add names via: tux edit  (or start tmux sessions)." >&2
+  exit 1
+fi
+
+# Inside tmux: show native menu, then switch-client
+if [[ -n "${TMUX-}" ]]; then
+  MENU_ARGS=()
+
+  # add an "Edit sessions" entry at the top
+  MENU_ARGS+=("✏️  Edit sessions" "" "run-shell \"tux edit\"")
+  MENU_ARGS+=("" "" "")  # separator
+
+  while IFS= read -r s; do
+    MENU_ARGS+=(
+      "$s" "" \
+      "run-shell \"tmux new-session -A -d -s '$s'; tmux switch-client -t '$s'\""
+    )
+  done <<< "$SESSIONS"
+
+  tmux display-menu -T "tux sessions" "${MENU_ARGS[@]}"
+  exit 0
+fi
+
+# Outside tmux: pick in terminal, then attach/create
+pick=""
+if command -v fzf >/dev/null 2>&1; then
+  pick="$(printf '%s\n' "$SESSIONS" | fzf --prompt='tux > ')"
+else
+  echo "Pick a session:"
+  mapfile -t arr < <(printf '%s\n' "$SESSIONS")
+  select opt in "${arr[@]}"; do
+    pick="${opt-}"
+    break
+  done
+fi
+
+[[ -z "${pick}" ]] && exit 0
+exec tmux new-session -A -s "$pick"
