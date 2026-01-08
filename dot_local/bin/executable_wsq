@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec watch -n 0.5 "squeue -u xwang397"

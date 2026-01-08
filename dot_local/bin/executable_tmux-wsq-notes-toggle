@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -u
+
+# Must be inside tmux
+tmux display-message -p "#{session_name}" >/dev/null 2>&1 || exit 1
+
+WSQ_BIN="$HOME/.local/bin/wsq"
+NOTES_FILE="$HOME/tmux-notes/scratch.md"
+
+# Window-scoped state (pane ids)
+wsq_pane="$(tmux show-option -wqv "@tux_wsq_pane" 2>/dev/null || true)"
+notes_pane="$(tmux show-option -wqv "@tux_notes_pane" 2>/dev/null || true)"
+
+# ---- TOGGLE OFF: autosave notes, then close panes ----
+if [[ -n "${wsq_pane}" || -n "${notes_pane}" ]]; then
+  if [[ -n "${notes_pane}" ]]; then
+    # Autosave without prompts: write only if modified.
+    # Send: <Esc> :silent! update <Enter>
+    tmux send-keys -t "$notes_pane" Escape ":silent! update" Enter 2>/dev/null || true
+    # small pause so the write completes before we kill the pane
+    sleep 0.12
+  fi
+
+  [[ -n "${wsq_pane}"   ]] && tmux kill-pane -t "$wsq_pane"   2>/dev/null || true
+  [[ -n "${notes_pane}" ]] && tmux kill-pane -t "$notes_pane" 2>/dev/null || true
+
+  tmux set-option -wu "@tux_wsq_pane" 2>/dev/null || true
+  tmux set-option -wu "@tux_notes_pane" 2>/dev/null || true
+  exit 0
+fi
+
+# ---- TOGGLE ON: create panes ----
+mkdir -p "$HOME/tmux-notes"
+touch "$NOTES_FILE"
+
+cur="$(tmux display-message -p "#{pane_id}")" || exit 1
+[[ -x "$WSQ_BIN" ]] || exit 1
+
+# tmux on your system: use -l <percent>% (NOT -p)
+right="$(tmux split-window -h -l 40% -t "$cur" -P -F "#{pane_id}")" || exit 1
+bottom="$(tmux split-window -v -l 50% -t "$right" -P -F "#{pane_id}")" || exit 1
+
+tmux set-option -w "@tux_wsq_pane" "$right"
+tmux set-option -w "@tux_notes_pane" "$bottom"
+
+tmux select-pane -t "$right"  -T "WSQ"   2>/dev/null || true
+tmux select-pane -t "$bottom" -T "Notes" 2>/dev/null || true
+
+tmux respawn-pane -k -t "$right" "$WSQ_BIN"
+
+# Use vim with no swapfile (-n) to avoid swap prompts if interrupted
+tmux respawn-pane -k -t "$bottom" "vim -n \"$NOTES_FILE\""
+
+tmux select-pane -t "$right" 2>/dev/null || true
