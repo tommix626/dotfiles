@@ -98,6 +98,8 @@ alias l='ls -CF'
 if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
 fi
+# Alt location
+[[ -f ~/.config/bash/aliases.sh ]] && source ~/.config/bash/aliases.sh
 
 # enable programmable completion features (you don't need to enable
 # this, if it's already enabled in /etc/bash.bashrc and /etc/profile
@@ -127,3 +129,9 @@ unset __conda_setup
 
 # ---- Host / machine specific extras ----
 [ -f ~/.bashrc.d/ia1.sh ] && source ~/.bashrc.d/ia1.sh
+
+
+# Starship prompt
+if command -v starship >/dev/null 2>&1; then
+  eval "$(starship init bash)"
+fi
