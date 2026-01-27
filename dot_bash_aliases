@@ -1,0 +1,1 @@
+alias sinfo_long='sinfo -O "Partition:.10 ,Available:.6 ,Time:.11 ,Nodes:.5 ,StateLong:12, Gres,GresUsed:24,CPUsState,CPUsLoad,AllocMem,Memory,FreeMem,NodeList" | less -SN'
