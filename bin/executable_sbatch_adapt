@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sbatch_adapt.sh
+# ----------------
+# Adapter that wraps an existing script with cluster-specific Slurm headers and env setup.
+# It supports:
+#   - Legacy Slurm scripts (with #SBATCH lines): strips old headers and PYTHONPATH, keeps the body.
+#   - Plain bash scripts (e.g., ofat.sh): runs them from within the adapted Slurm job.
+#
+# Examples:
+#   # 1) Adapt a legacy Slurm script (old_cluster_job.sh) and submit with defaults
+#   #    sbatch_adapt.sh scripts/old_cluster_job.sh
+#   #
+#   # 2) Adapt and submit the OFAT experiment driver (no #SBATCH in file)
+#   #    sbatch_adapt.sh ofat.sh
+#   #
+#   # 3) Override Slurm options on the fly (forwarded to sbatch)
+#   #    PARTITION=gpu-a100 GPUS=4 TIME=24:00:00 CONDA_ENV=torch-old-env sbatch_adapt.sh ofat.sh --qos=interactive
+#
+# Usage:
+#   $0 path/to/original_script.sh [extra sbatch args...]
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 path/to/original_script.sh [extra sbatch args...]"
+  echo
+  echo "Examples:"
+  echo "  # Adapt a legacy Slurm script and submit"
+  echo "  $0 scripts/old_cluster_job.sh"
+  echo
+  echo "  # Adapt and submit the OFAT experiment driver (no #SBATCH in file)"
+  echo "  $0 ofat.sh"
+  echo
+  echo "  # Override Slurm options via env vars and pass extra sbatch flags"
+  echo "  PARTITION=gpu-a100 GPUS=4 TIME=24:00:00 CONDA_ENV=torch-old-env $0 ofat.sh --qos=interactive"
+  echo
+  echo "Environment variables (cluster defaults):"
+  echo "  JOB_NAME        - default: basename of the original script without .sh"
+  echo "  ACCOUNT         - Slurm account (empty = let adapter choose or omit -A)"
+  echo "  PARTITION       - partition name (default: gpu)"
+  echo "  NODES           - number of nodes (default: 1)"
+  echo "  GPUS            - GPUs per job (default: 8)"
+  echo "  TIME            - walltime (default: 12:00:00)"
+  echo "  MAIL_USER       - email for Slurm notifications (default: xwang397@jh.edu)"
+  echo "  MAIL_TYPE       - email events (default: FAIL)"
+  echo "  NTASKS_PER_NODE - tasks per node (optional)"
+  echo "  CPUS_PER_TASK   - CPUs per task (optional)"
+  echo "  CONDA_ENV       - conda environment to activate (default: torch)"
+  echo
+  echo "Any additional arguments after the script path are forwarded directly to sbatch."
+  exit 2
+fi
+
+ORIG="$1"
+shift || true
+
+# ---- cluster-specific defaults (override via env vars if you want) ----
+JOB_NAME="${JOB_NAME:-$(basename "${ORIG%.sh}")}"
+ACCOUNT="${ACCOUNT:-}"          # empty means “don’t emit -A” unless required
+PARTITION="${PARTITION:-gpu}"
+NODES="${NODES:-1}"
+GPUS="${GPUS:-8}"
+TIME="${TIME:-12:00:00}"
+MAIL_USER="${MAIL_USER:-xwang397@jh.edu}"
+MAIL_TYPE="${MAIL_TYPE:-FAIL}"
+CONDA_ENV="${CONDA_ENV:-torch}"
+
+# If you want CPU control too, set these env vars when calling:
+#   NTASKS_PER_NODE=16 CPUS_PER_TASK=8
+NTASKS_PER_NODE="${NTASKS_PER_NODE:-}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-}"
+
+# ---- project root = where sbatch_adapt is invoked ----
+ROOT_DIR="$(pwd)"
+
+DRY_RUN="${DRY_RUN:-0}"
+
+TMP="$(mktemp /tmp/slurm_adapt_XXXXXX.sh)"
+trap 'rm -f "$TMP"' EXIT
+
+mkdir -p logs
+
+# Auto-account rules (unless user explicitly sets ACCOUNT=...)
+AUTO_ACCOUNT=""
+case "$PARTITION" in
+  gpu-a100* ) AUTO_ACCOUNT="a100acct" ;;
+  *        ) AUTO_ACCOUNT="" ;;
+esac
+
+EFFECTIVE_ACCOUNT="$ACCOUNT"
+if [[ -z "$EFFECTIVE_ACCOUNT" ]]; then
+  EFFECTIVE_ACCOUNT="$AUTO_ACCOUNT"
+fi
+
+{
+  echo '#!/bin/bash'
+  echo "#SBATCH --job-name=${JOB_NAME}"
+  if [[ -n "$EFFECTIVE_ACCOUNT" ]]; then
+    echo "#SBATCH -A ${EFFECTIVE_ACCOUNT}"
+  fi
+  echo "#SBATCH --partition=${PARTITION}"
+  echo "#SBATCH --nodes=${NODES}"
+  echo "#SBATCH --gpus=${GPUS}"
+  echo "#SBATCH --time=${TIME}"
+  echo "#SBATCH --output=logs/${JOB_NAME}_%j.out"
+  echo "#SBATCH --error=logs/${JOB_NAME}_%j.err"
+  echo "#SBATCH --mail-user=${MAIL_USER}"
+  echo "#SBATCH --mail-type=${MAIL_TYPE}"
+  [[ -n "$NTASKS_PER_NODE" ]] && echo "#SBATCH --ntasks-per-node=${NTASKS_PER_NODE}"
+  [[ -n "$CPUS_PER_TASK"   ]] && echo "#SBATCH --cpus-per-task=${CPUS_PER_TASK}"
+  echo "#SBATCH --chdir=${ROOT_DIR}"
+  echo
+  # ---- cluster prolog ----
+  echo 'module purge'
+  echo 'module load conda'
+  echo 'conda --version'
+  echo '/bin/hostname'
+  echo 'source $(conda info --base)/etc/profile.d/conda.sh'
+  echo "conda activate ${CONDA_ENV}"
+  echo
+  # ---- safety + dynamic PYTHONPATH ----
+  echo 'set -euo pipefail'
+  echo "export PYTHONPATH=\"${ROOT_DIR}\${PYTHONPATH:+:\$PYTHONPATH}\""
+  echo "cd \"${ROOT_DIR}\""
+  echo 'echo "CWD: $(pwd)"'
+} > "$TMP"
+
+# ---- append the ORIGINAL BODY ----
+# If the original script is a Slurm script (contains #SBATCH), strip its headers
+# and PYTHONPATH lines and reuse only the body. Otherwise (e.g., a plain bash
+# script like ofat.sh), just invoke it from this job.
+if grep -q '^#SBATCH[[:space:]]' "$ORIG"; then
+  awk '
+    BEGIN{start=0}
+    /^#SBATCH[[:space:]]/{next}
+    start==0 {
+      if ($0 ~ /^set -euo pipefail[[:space:]]*$/) { start=1; next }  # we already emitted it
+      next
+    }
+    /^export[[:space:]]+PYTHONPATH=/{next}
+    {print}
+  ' "$ORIG" >> "$TMP"
+else
+  {
+    echo
+    echo "# Invoke original script (no Slurm headers detected)"
+    echo "bash \"$ORIG\""
+  } >> "$TMP"
+fi
+
+# Any extra args you pass after the script path go straight to sbatch (optional overrides)
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "=== DRY RUN: generated script at: $TMP ===" >&2
+  echo "---- BEGIN SCRIPT ----"
+  cat "$TMP"
+  echo "---- END SCRIPT ----"
+  exit 0
+fi
+
+sbatch "$@" "$TMP"
